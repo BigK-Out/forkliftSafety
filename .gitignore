@@ -76,5 +76,6 @@ recordings/
 # User-requested markdown ignore
 *.md
 config/calibration_back.json
+config/calibrations/
 config/safetyvision.dev.yaml.last-good
 *.last-good

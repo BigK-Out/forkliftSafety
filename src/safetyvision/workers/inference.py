@@ -150,29 +150,48 @@ def _postprocess(
 
     has_objectness = parsed.shape[1] > 84
 
-    detections: List[Detection] = []
-    for row in parsed:
-        if has_objectness:
-            # YOLOv5: [cx, cy, w, h, obj_conf, cls0, cls1, ...]
-            obj_conf = row[4]
-            class_scores = row[5:]
-            cls_id = int(np.argmax(class_scores))
-            conf = float(obj_conf * class_scores[cls_id])
-        else:
-            # YOLOv8: [cx, cy, w, h, cls0, cls1, ...]
-            class_scores = row[4:]
-            cls_id = int(np.argmax(class_scores))
-            conf = float(class_scores[cls_id])
+    # Vectorized scoring: avoids a per-row Python loop over thousands of
+    # anchors, which was the dominant per-frame cost (12.8→15+ FPS target).
+    if has_objectness:
+        # YOLOv5: [cx, cy, w, h, obj_conf, cls0, cls1, ...]
+        obj_conf = parsed[:, 4]
+        class_scores = parsed[:, 5:]
+        cls_ids = np.argmax(class_scores, axis=1)
+        confs = obj_conf * class_scores[np.arange(class_scores.shape[0]), cls_ids]
+    else:
+        # YOLOv8/YOLO11/YOLO26: [cx, cy, w, h, cls0, cls1, ...]
+        class_scores = parsed[:, 4:]
+        cls_ids = np.argmax(class_scores, axis=1)
+        confs = class_scores[np.arange(class_scores.shape[0]), cls_ids]
 
-        if cls_id != person_class_id or conf < conf_thresh:
-            continue
+    mask = (cls_ids == person_class_id) & (confs >= conf_thresh)
+    if not np.any(mask):
+        return []
 
-        cx, cy, w, h = row[0], row[1], row[2], row[3]
-        x1 = (cx - w / 2 - pad[0]) / scale
-        y1 = (cy - h / 2 - pad[1]) / scale
-        x2 = (cx + w / 2 - pad[0]) / scale
-        y2 = (cy + h / 2 - pad[1]) / scale
-        detections.append(Detection(x1=x1, y1=y1, x2=x2, y2=y2, confidence=conf, class_id=cls_id))
+    kept = parsed[mask]
+    kept_confs = confs[mask]
+    kept_cls = cls_ids[mask]
+
+    cx = kept[:, 0]
+    cy = kept[:, 1]
+    w = kept[:, 2]
+    h = kept[:, 3]
+    x1 = (cx - w / 2 - pad[0]) / scale
+    y1 = (cy - h / 2 - pad[1]) / scale
+    x2 = (cx + w / 2 - pad[0]) / scale
+    y2 = (cy + h / 2 - pad[1]) / scale
+
+    detections: List[Detection] = [
+        Detection(
+            x1=float(x1[i]),
+            y1=float(y1[i]),
+            x2=float(x2[i]),
+            y2=float(y2[i]),
+            confidence=float(kept_confs[i]),
+            class_id=int(kept_cls[i]),
+        )
+        for i in range(kept.shape[0])
+    ]
 
     return _nms(detections, iou_thresh)
 

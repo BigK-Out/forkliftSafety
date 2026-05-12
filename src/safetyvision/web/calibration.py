@@ -8,6 +8,8 @@ be injected without circular imports.
 from __future__ import annotations
 
 import json
+import re
+import shutil
 import subprocess
 import time
 from datetime import datetime, timezone
@@ -111,6 +113,33 @@ def _calibration_path(raw: dict) -> str:
     return _alert_section(raw).get("calibration_path", "config/calibration_back.json")
 
 
+def _history_dir(active_path: Path) -> Path:
+    """Directory of timestamped calibration archives (sibling of active file)."""
+    return active_path.parent / "calibrations"
+
+
+# Safe filename pattern for /history/load — restricts to files we generated
+# (stem + ISO-compact timestamp + .json) so the endpoint can't be coerced
+# into reading arbitrary paths.
+_HISTORY_NAME_RE = re.compile(r"^[A-Za-z0-9_\-]+\.json$")
+
+
+def _archive_calibration(active_path: Path, record: dict) -> Path:
+    """Write a timestamped copy of *record* under the history dir.
+
+    Returns the archive path. The active file is the source of truth for
+    the runtime; the archive is purely for "load previous" UX.
+    """
+    hist_dir = _history_dir(active_path)
+    hist_dir.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    name = f"{active_path.stem}_{ts}{active_path.suffix}"
+    archive_path = hist_dir / name
+    with open(archive_path, "w") as f:
+        json.dump(record, f, indent=2)
+    return archive_path
+
+
 def _restart_service() -> tuple[bool, str]:
     """Restart safetyvision via systemctl. Returns (ok, message)."""
     try:
@@ -198,7 +227,20 @@ def create_calibration_router(
         }
         with open(cal_path, "w") as f:
             json.dump(record, f, indent=2)
-        return {"ok": True, "path": str(cal_path)}
+        # Archive a timestamped copy so the user can browse / restore
+        # previous calibrations from the UI.
+        archive_path: Optional[Path] = None
+        try:
+            archive_path = _archive_calibration(cal_path, record)
+        except OSError as e:
+            # Archive failures are non-fatal — the active calibration is
+            # already saved and reload-on-mtime will pick it up.
+            archive_path = None
+        return {
+            "ok": True,
+            "path": str(cal_path),
+            "archive": str(archive_path) if archive_path else None,
+        }
 
     @router.delete("")
     async def delete_calibration(_t: str = Depends(check_session)):
@@ -208,6 +250,95 @@ def create_calibration_router(
             raise HTTPException(status_code=404, detail="No calibration to delete")
         cal_path.unlink()
         return {"ok": True}
+
+    @router.get("/history")
+    async def list_history(_t: str = Depends(check_session)):
+        """List archived calibrations, newest first."""
+        raw = _load_yaml(get_config_path())
+        cal_path = Path(_calibration_path(raw))
+        hist_dir = _history_dir(cal_path)
+        if not hist_dir.exists():
+            return {"items": []}
+
+        try:
+            active_mtime = cal_path.stat().st_mtime if cal_path.exists() else None
+        except OSError:
+            active_mtime = None
+
+        items: list[dict] = []
+        for p in hist_dir.glob(f"{cal_path.stem}_*{cal_path.suffix}"):
+            try:
+                with open(p) as f:
+                    data = json.load(f)
+                created_at = data.get("created_at") or ""
+                frame_w = data.get("frame_width")
+                frame_h = data.get("frame_height")
+            except (OSError, json.JSONDecodeError):
+                continue
+            try:
+                mtime = p.stat().st_mtime
+            except OSError:
+                mtime = 0.0
+            items.append({
+                "filename": p.name,
+                "created_at": created_at,
+                "mtime": mtime,
+                "frame_width": frame_w,
+                "frame_height": frame_h,
+                "active": (active_mtime is not None and abs(mtime - active_mtime) < 0.5),
+            })
+        items.sort(key=lambda x: x["mtime"], reverse=True)
+        return {"items": items}
+
+    class _LoadHistoryBody(BaseModel):
+        filename: str
+
+    @router.post("/history/load")
+    async def load_history(
+        body: _LoadHistoryBody, _t: str = Depends(check_session)
+    ):
+        """Promote an archived calibration to the active file.
+
+        The inference worker's DistanceZoneStrategy watches the active
+        file's mtime and reloads, so no service restart is needed.
+        """
+        if not _HISTORY_NAME_RE.match(body.filename):
+            raise HTTPException(status_code=400, detail="Invalid filename")
+
+        raw = _load_yaml(get_config_path())
+        cal_path = Path(_calibration_path(raw))
+        hist_dir = _history_dir(cal_path)
+        src = hist_dir / body.filename
+        # Defence in depth: resolve and confirm src is still under hist_dir.
+        try:
+            src_resolved = src.resolve(strict=True)
+            hist_resolved = hist_dir.resolve(strict=True)
+        except (OSError, FileNotFoundError):
+            raise HTTPException(status_code=404, detail="Calibration not found")
+        if hist_resolved not in src_resolved.parents:
+            raise HTTPException(status_code=400, detail="Invalid path")
+
+        # Validate the archived calibration before promoting it.
+        try:
+            with open(src_resolved) as f:
+                data = json.load(f)
+            payload = CalibrationPayload(
+                source_points=data["source_points"],
+                target_points=data["target_points"],
+                frame_width=int(data["frame_width"]),
+                frame_height=int(data["frame_height"]),
+            )
+            _validate(payload)
+        except (OSError, KeyError, ValueError, CalibrationError) as e:
+            raise HTTPException(status_code=400, detail=f"Archive invalid: {e}")
+
+        cal_path.parent.mkdir(parents=True, exist_ok=True)
+        # Atomic replace so a partial copy can never be visible to the
+        # inference worker between reload polls.
+        tmp = cal_path.with_suffix(cal_path.suffix + ".tmp")
+        shutil.copy2(src_resolved, tmp)
+        tmp.replace(cal_path)
+        return {"ok": True, "loaded": body.filename, "path": str(cal_path)}
 
     def _toggle(target_mode: str) -> JSONResponse:
         now = time.time()

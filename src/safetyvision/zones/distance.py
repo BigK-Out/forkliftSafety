@@ -7,6 +7,7 @@ from pathlib import Path
 
 import cv2
 import numpy as np
+from loguru import logger
 
 from safetyvision.types import Detection
 from safetyvision.zones.base import ZoneResult
@@ -57,10 +58,22 @@ class DistanceZoneStrategy:
         warning_m: float,
         smoothing_frames: int = 3,
     ):
-        path = Path(calibration_path)
-        if not path.exists():
+        self._calibration_path = Path(calibration_path)
+        if not self._calibration_path.exists():
             raise FileNotFoundError(f"Calibration file not found: {calibration_path}")
-        with open(path) as f:
+
+        self._danger_m = float(danger_m)
+        self._warning_m = float(warning_m)
+        self._smoothing = max(1, int(smoothing_frames))
+        self._buffer: list[float] = []
+        self._calibration_mtime: float = 0.0
+        # Load initial homography (raises on bad calibration, so the worker
+        # fails fast at startup rather than silently using stale data).
+        self._load_calibration()
+
+    def _load_calibration(self) -> None:
+        """Read the JSON, build a fresh homography, snapshot mtime."""
+        with open(self._calibration_path) as f:
             data = json.load(f)
 
         source = np.array(data["source_points"], dtype=np.float32)
@@ -72,10 +85,39 @@ class DistanceZoneStrategy:
             )
 
         self._homography = _Homography(source, target)
-        self._danger_m = float(danger_m)
-        self._warning_m = float(warning_m)
-        self._smoothing = max(1, int(smoothing_frames))
-        self._buffer: list[float] = []
+        self._calibration_mtime = self._calibration_path.stat().st_mtime
+        # Smoothing buffer holds distances from the previous homography;
+        # clear it so the dashboard reflects the new calibration immediately.
+        self._buffer.clear()
+
+    def _maybe_reload(self) -> None:
+        """Reload homography if the calibration file changed on disk.
+
+        Called on every ``classify()``; one stat() per frame is negligible
+        and lets the Calibration UI's POST be visible on the Dashboard
+        without restarting the service.
+        """
+        try:
+            mtime = self._calibration_path.stat().st_mtime
+        except OSError:
+            return
+        if mtime == self._calibration_mtime:
+            return
+        try:
+            self._load_calibration()
+            logger.info(
+                "Distance calibration reloaded from {}", self._calibration_path
+            )
+        except (OSError, ValueError, KeyError) as e:
+            # Keep the previous (valid) homography; bump the mtime so we
+            # don't retry on every frame until the file changes again.
+            try:
+                self._calibration_mtime = self._calibration_path.stat().st_mtime
+            except OSError:
+                pass
+            logger.warning(
+                "Calibration reload failed, keeping previous homography: {}", e
+            )
 
     def classify(
         self,
@@ -83,6 +125,7 @@ class DistanceZoneStrategy:
         frame_h: int,
         frame_w: int,
     ) -> ZoneResult:
+        self._maybe_reload()
         if not detections:
             self._buffer.clear()
             return ZoneResult(zone_level="", distance_m=None)

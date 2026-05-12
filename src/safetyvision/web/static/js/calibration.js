@@ -14,6 +14,7 @@ const actionStatus = document.getElementById('actionStatus');
 const modeBadge = document.getElementById('modeBadge');
 const toast = document.getElementById('toast');
 const logoutBtn = document.getElementById('logoutBtn');
+const historyList = document.getElementById('historyList');
 
 const POINT_COLORS = ['#00c853', '#ffd600', '#448aff', '#ff1744'];
 const REDUCED_MOTION = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
@@ -232,7 +233,85 @@ saveBtn.addEventListener('click', async () => {
   actionStatus.textContent = 'Saved to ' + data.path;
   showToast('Calibration saved', 'success');
   refreshStatus();
+  refreshHistory();
 });
+
+function formatCreatedAt(iso) {
+  if (!iso) return '(unknown time)';
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return iso;
+  return d.toLocaleString();
+}
+
+async function refreshHistory() {
+  if (!historyList) return;
+  try {
+    const r = await fetch('/api/calibration/history');
+    if (!r.ok) {
+      if (r.status === 401) window.location.href = '/login';
+      historyList.innerHTML =
+        '<div class="point-empty">Could not load history.</div>';
+      return;
+    }
+    const data = await r.json();
+    const items = (data.items || []);
+    if (items.length === 0) {
+      historyList.innerHTML =
+        '<div class="point-empty">No previous calibrations yet.</div>';
+      return;
+    }
+    historyList.innerHTML = '';
+    items.forEach(item => {
+      const row = document.createElement('div');
+      row.className = 'history-row' + (item.active ? ' active' : '');
+      const dims = (item.frame_width && item.frame_height)
+        ? `${item.frame_width}×${item.frame_height}` : '';
+      row.innerHTML = `
+        <div class="history-meta">
+          <div class="history-when">${formatCreatedAt(item.created_at)}</div>
+          <div class="history-sub">
+            <span class="history-name">${item.filename}</span>
+            ${dims ? `<span class="dim">· ${dims}</span>` : ''}
+            ${item.active ? '<span class="active-badge">active</span>' : ''}
+          </div>
+        </div>
+        <button class="btn-secondary history-load" data-filename="${item.filename}" ${item.active ? 'disabled' : ''}>
+          <i data-lucide="upload" style="width:12px;height:12px;"></i>
+          Load
+        </button>
+      `;
+      historyList.appendChild(row);
+    });
+    historyList.querySelectorAll('.history-load').forEach(btn => {
+      btn.addEventListener('click', () => loadHistoryItem(btn.dataset.filename));
+    });
+    if (window.lucide && typeof window.lucide.createIcons === 'function') {
+      window.lucide.createIcons();
+    }
+  } catch (err) {
+    historyList.innerHTML =
+      '<div class="point-empty">Error: ' + err.message + '</div>';
+  }
+}
+
+async function loadHistoryItem(filename) {
+  if (!confirm(`Load "${filename}" as the active calibration?`)) return;
+  actionStatus.textContent = 'Loading ' + filename + '...';
+  const r = await fetch('/api/calibration/history/load', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ filename }),
+  });
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok || data.ok === false) {
+    actionStatus.textContent = 'Load failed: ' + (data.detail || data.error || r.statusText);
+    showToast('Load failed', 'error');
+    return;
+  }
+  actionStatus.textContent = 'Loaded ' + filename + ' — Dashboard will reflect within ~1 frame.';
+  showToast('Calibration activated', 'success');
+  refreshHistory();
+}
 
 async function postToggle(path, label) {
   if (!confirm(`${label}? This will restart the SafetyVision service.`)) return;
@@ -263,3 +342,4 @@ if (window.lucide && typeof window.lucide.createIcons === 'function') {
 }
 
 refreshStatus();
+refreshHistory();
