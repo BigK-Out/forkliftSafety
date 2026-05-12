@@ -25,6 +25,10 @@ const state = {
   frameHeight: 480,
   points: [], // [{px, py, xm, ym}]
 };
+// Map filename -> last-seen item from /api/calibration/history. Filled by
+// refreshHistory(); read by previewHistoryItem() and loadHistoryItem() so
+// they can show the archived frame + points without re-fetching the list.
+let historyItemsByName = {};
 
 function showToast(msg, kind = 'info') {
   toast.textContent = msg;
@@ -261,7 +265,11 @@ async function refreshHistory() {
       return;
     }
     historyList.innerHTML = '';
+    // Cache the most recent item-by-filename for the Load handler so the
+    // archived points + frame flag don't need a second round-trip.
+    historyItemsByName = {};
     items.forEach(item => {
+      historyItemsByName[item.filename] = item;
       const row = document.createElement('div');
       row.className = 'history-row' + (item.active ? ' active' : '');
       const dims = (item.frame_width && item.frame_height)
@@ -272,18 +280,28 @@ async function refreshHistory() {
           <div class="history-sub">
             <span class="history-name">${item.filename}</span>
             ${dims ? `<span class="dim">· ${dims}</span>` : ''}
+            <span class="dim">· ${item.has_frame ? 'frame ✓' : 'no frame'}</span>
             ${item.active ? '<span class="active-badge">active</span>' : ''}
           </div>
         </div>
-        <button class="btn-secondary history-load" data-filename="${item.filename}" ${item.active ? 'disabled' : ''}>
-          <i data-lucide="upload" style="width:12px;height:12px;"></i>
-          Load
-        </button>
+        <div class="history-actions">
+          <button class="btn-secondary history-preview" data-filename="${item.filename}" title="Show this calibration's frame and points without activating it">
+            <i data-lucide="eye" style="width:12px;height:12px;"></i>
+            Preview
+          </button>
+          <button class="btn-secondary history-load" data-filename="${item.filename}" ${item.active ? 'disabled' : ''}>
+            <i data-lucide="upload" style="width:12px;height:12px;"></i>
+            Load
+          </button>
+        </div>
       `;
       historyList.appendChild(row);
     });
     historyList.querySelectorAll('.history-load').forEach(btn => {
       btn.addEventListener('click', () => loadHistoryItem(btn.dataset.filename));
+    });
+    historyList.querySelectorAll('.history-preview').forEach(btn => {
+      btn.addEventListener('click', () => previewHistoryItem(btn.dataset.filename));
     });
     if (window.lucide && typeof window.lucide.createIcons === 'function') {
       window.lucide.createIcons();
@@ -294,20 +312,104 @@ async function refreshHistory() {
   }
 }
 
+// Load an image into the canvas from a URL. Returns true on success.
+async function loadCanvasFromUrl(url, statusLabel) {
+  try {
+    const r = await fetch(url, { cache: 'no-store' });
+    if (!r.ok) return false;
+    const blob = await r.blob();
+    const objUrl = URL.createObjectURL(blob);
+    return await new Promise((resolve) => {
+      const img = new Image();
+      img.onload = () => {
+        state.frameImg = img;
+        state.frameWidth = img.naturalWidth;
+        state.frameHeight = img.naturalHeight;
+        canvas.width = img.naturalWidth;
+        canvas.height = img.naturalHeight;
+        state.frameLoaded = true;
+        placeholder.style.display = 'none';
+        frameStatus.textContent =
+          `${statusLabel} ${img.naturalWidth}×${img.naturalHeight}`;
+        URL.revokeObjectURL(objUrl);
+        resolve(true);
+      };
+      img.onerror = () => { URL.revokeObjectURL(objUrl); resolve(false); };
+      img.src = objUrl;
+    });
+  } catch (_err) {
+    return false;
+  }
+}
+
+// Paint the archive's saved frame on the canvas (or the current live
+// frame if no snapshot was archived) and pre-fill the 4 points from
+// its source/target so the user can see exactly what was clicked.
+// Returns the kind of frame shown: 'archived', 'live', or 'none'.
+async function showHistoryFrame(item) {
+  if (!item) return 'none';
+  const srcPts = item.source_points || [];
+  const tgtPts = item.target_points || [];
+  if (srcPts.length !== 4 || tgtPts.length !== 4) {
+    showToast('Archive missing points', 'warn');
+    return 'none';
+  }
+
+  let frameKind = 'none';
+  if (item.has_frame) {
+    const url = '/api/calibration/history/frame?filename='
+      + encodeURIComponent(item.filename);
+    if (await loadCanvasFromUrl(url, 'Archived frame')) frameKind = 'archived';
+  }
+  // Fallback: no snapshot in the archive (older save) — show the live
+  // frame so the points have some visual reference. The points are still
+  // in the same pixel coordinates the user clicked, so they line up if
+  // the camera hasn't moved.
+  if (frameKind === 'none') {
+    if (await loadCanvasFromUrl('/api/calibration/frame', 'Live frame')) {
+      frameKind = 'live';
+    }
+  }
+
+  state.points = srcPts.map((p, i) => ({
+    px: p[0],
+    py: p[1],
+    xm: tgtPts[i][0],
+    ym: tgtPts[i][1],
+  }));
+  redraw();
+  rebuildPointInputs();
+  return frameKind;
+}
+
+async function previewHistoryItem(filename) {
+  const item = historyItemsByName[filename];
+  if (!item) return;
+  const kind = await showHistoryFrame(item);
+  const frameNote = {
+    archived: 'showing the frame captured at calibration time',
+    live: 'no snapshot was archived — showing the current live frame',
+    none: 'no frame available — Capture a frame to see the points',
+  }[kind] || '';
+  actionStatus.textContent =
+    `Previewing ${filename} — ${frameNote}. Press Load to apply.`;
+}
+
 async function loadHistoryItem(filename) {
   if (!confirm(`Load "${filename}" as the active calibration?`)) return;
   actionStatus.textContent = 'Loading ' + filename + '...';
-  const r = await fetch('/api/calibration/history/load', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ filename }),
-  });
+  const url = '/api/calibration/history/load?filename='
+    + encodeURIComponent(filename);
+  const r = await fetch(url, { method: 'POST' });
   const data = await r.json().catch(() => ({}));
   if (!r.ok || data.ok === false) {
     actionStatus.textContent = 'Load failed: ' + (data.detail || data.error || r.statusText);
     showToast('Load failed', 'error');
     return;
   }
+  // Show the archived frame + points on the canvas, then refresh the
+  // history listing so the "active" badge moves to this row.
+  await showHistoryFrame(historyItemsByName[filename]);
   actionStatus.textContent = 'Loaded ' + filename + ' — Dashboard will reflect within ~1 frame.';
   showToast('Calibration activated', 'success');
   refreshHistory();

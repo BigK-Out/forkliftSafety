@@ -476,10 +476,16 @@
   background: rgba(63,185,80,0.12);
   border: 1px solid rgba(63,185,80,0.35);
 }
-.history-load {
+.history-load,
+.history-preview {
   flex: 0 0 auto;
   padding: 6px 10px !important;
   font-size: 11px;
+}
+.history-actions {
+  display: flex;
+  gap: 6px;
+  flex: 0 0 auto;
 }
 
 /* ── Responsive ─────────────────────────────────────────────────────── */

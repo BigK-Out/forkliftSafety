@@ -127,6 +127,11 @@ _HISTORY_NAME_RE = re.compile(r"^[A-Za-z0-9_\-]+\.json$")
 def _archive_calibration(active_path: Path, record: dict) -> Path:
     """Write a timestamped copy of *record* under the history dir.
 
+    Also snapshots the current capture frame next to the JSON (same
+    stem + ``.jpg``) so the Calibration UI can later show the exact
+    frame the points were placed on. Missing/stale snapshots are
+    tolerated — the archive is still written.
+
     Returns the archive path. The active file is the source of truth for
     the runtime; the archive is purely for "load previous" UX.
     """
@@ -137,6 +142,17 @@ def _archive_calibration(active_path: Path, record: dict) -> Path:
     archive_path = hist_dir / name
     with open(archive_path, "w") as f:
         json.dump(record, f, indent=2)
+
+    # Snapshot the latest capture frame alongside the JSON. The capture
+    # worker writes /dev/shm/.../frame_back.jpg every ~1s, so this is
+    # at most 1s stale — close enough that the displayed click points
+    # still line up with the geometry at calibration time.
+    try:
+        frame_src = Path(CALIBRATION_FRAME_PATH)
+        if frame_src.exists():
+            shutil.copy2(frame_src, archive_path.with_suffix(".jpg"))
+    except OSError:
+        pass
     return archive_path
 
 
@@ -285,30 +301,58 @@ def create_calibration_router(
                 "mtime": mtime,
                 "frame_width": frame_w,
                 "frame_height": frame_h,
+                "has_frame": p.with_suffix(".jpg").exists(),
+                "source_points": data.get("source_points"),
+                "target_points": data.get("target_points"),
                 "active": (active_mtime is not None and abs(mtime - active_mtime) < 0.5),
             })
         items.sort(key=lambda x: x["mtime"], reverse=True)
         return {"items": items}
 
-    class _LoadHistoryBody(BaseModel):
-        filename: str
-
-    @router.post("/history/load")
-    async def load_history(
-        body: _LoadHistoryBody, _t: str = Depends(check_session)
+    @router.get("/history/frame")
+    async def get_history_frame(
+        filename: str, _t: str = Depends(check_session)
     ):
-        """Promote an archived calibration to the active file.
+        """Return the JPEG snapshot taken at calibration time, if any.
 
-        The inference worker's DistanceZoneStrategy watches the active
-        file's mtime and reloads, so no service restart is needed.
+        ``filename`` is the archive's JSON filename; the snapshot lives
+        next to it as ``<stem>.jpg``. Path is regex-whitelisted and
+        resolve()-confined to the history dir, matching ``/history/load``.
         """
-        if not _HISTORY_NAME_RE.match(body.filename):
+        if not _HISTORY_NAME_RE.match(filename):
             raise HTTPException(status_code=400, detail="Invalid filename")
 
         raw = _load_yaml(get_config_path())
         cal_path = Path(_calibration_path(raw))
         hist_dir = _history_dir(cal_path)
-        src = hist_dir / body.filename
+        jpg = (hist_dir / filename).with_suffix(".jpg")
+        try:
+            jpg_resolved = jpg.resolve(strict=True)
+            hist_resolved = hist_dir.resolve(strict=True)
+        except (OSError, FileNotFoundError):
+            raise HTTPException(status_code=404, detail="No frame snapshot")
+        if hist_resolved not in jpg_resolved.parents:
+            raise HTTPException(status_code=400, detail="Invalid path")
+        return FileResponse(str(jpg_resolved), media_type="image/jpeg")
+
+    @router.post("/history/load")
+    async def load_history(
+        filename: str, _t: str = Depends(check_session)
+    ):
+        """Promote an archived calibration to the active file.
+
+        ``filename`` is a query parameter (e.g.
+        ``POST /api/calibration/history/load?filename=...``). The
+        inference worker's DistanceZoneStrategy watches the active
+        file's mtime and reloads, so no service restart is needed.
+        """
+        if not _HISTORY_NAME_RE.match(filename):
+            raise HTTPException(status_code=400, detail="Invalid filename")
+
+        raw = _load_yaml(get_config_path())
+        cal_path = Path(_calibration_path(raw))
+        hist_dir = _history_dir(cal_path)
+        src = hist_dir / filename
         # Defence in depth: resolve and confirm src is still under hist_dir.
         try:
             src_resolved = src.resolve(strict=True)
@@ -338,7 +382,7 @@ def create_calibration_router(
         tmp = cal_path.with_suffix(cal_path.suffix + ".tmp")
         shutil.copy2(src_resolved, tmp)
         tmp.replace(cal_path)
-        return {"ok": True, "loaded": body.filename, "path": str(cal_path)}
+        return {"ok": True, "loaded": filename, "path": str(cal_path)}
 
     def _toggle(target_mode: str) -> JSONResponse:
         now = time.time()
