@@ -477,7 +477,8 @@
   border: 1px solid rgba(63,185,80,0.35);
 }
 .history-load,
-.history-preview {
+.history-preview,
+.history-delete {
   flex: 0 0 auto;
   padding: 6px 10px !important;
   font-size: 11px;
@@ -486,6 +487,8 @@
   display: flex;
   gap: 6px;
   flex: 0 0 auto;
+  flex-wrap: wrap;
+  justify-content: flex-end;
 }
 
 /* ── Responsive ─────────────────────────────────────────────────────── */

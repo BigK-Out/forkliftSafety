@@ -7,6 +7,8 @@ be injected without circular imports.
 
 from __future__ import annotations
 
+import base64
+import binascii
 import json
 import re
 import shutil
@@ -37,6 +39,11 @@ class CalibrationPayload(BaseModel):
     target_points: list[list[float]]
     frame_width: int
     frame_height: int
+    # Optional base-64-encoded JPEG of the frame the points were placed on.
+    # Either a raw base64 string or a data URL ("data:image/jpeg;base64,...").
+    # Sent by the UI so the archived frame is exactly what the user clicked
+    # on — no dependency on /dev/shm being populated at save time.
+    frame_jpeg_b64: Optional[str] = None
 
 
 class CalibrationError(ValueError):
@@ -124,16 +131,51 @@ def _history_dir(active_path: Path) -> Path:
 _HISTORY_NAME_RE = re.compile(r"^[A-Za-z0-9_\-]+\.json$")
 
 
-def _archive_calibration(active_path: Path, record: dict) -> Path:
+def _decode_b64_jpeg(b64: Optional[str]) -> Optional[bytes]:
+    """Decode 'data:image/jpeg;base64,...' or raw base64 into bytes.
+
+    Returns None on any malformed input — the caller treats absence of
+    a snapshot as best-effort (the calibration JSON is still saved).
+    """
+    if not b64:
+        return None
+    if "," in b64:
+        b64 = b64.split(",", 1)[1]
+    try:
+        return base64.b64decode(b64, validate=True)
+    except (binascii.Error, ValueError):
+        return None
+
+
+def _write_jpeg(target: Path, data: bytes) -> bool:
+    """Write JPEG bytes via tmp+rename so consumers never see a partial file."""
+    try:
+        tmp = target.with_suffix(target.suffix + ".tmp")
+        with open(tmp, "wb") as f:
+            f.write(data)
+        tmp.replace(target)
+        return True
+    except OSError:
+        return False
+
+
+def _archive_calibration(
+    active_path: Path,
+    record: dict,
+    frame_jpeg: Optional[bytes] = None,
+) -> Path:
     """Write a timestamped copy of *record* under the history dir.
 
-    Also snapshots the current capture frame next to the JSON (same
-    stem + ``.jpg``) so the Calibration UI can later show the exact
-    frame the points were placed on. Missing/stale snapshots are
-    tolerated — the archive is still written.
+    Also writes a sibling ``<stem>.jpg`` snapshot so the Calibration UI
+    can later show the exact frame the points were placed on. The
+    snapshot source is, in order of preference:
+      1. *frame_jpeg* bytes supplied by the caller (sent by the UI with
+         the save request) — most accurate.
+      2. The latest /dev/shm capture — fallback for clients that don't
+         send the frame.
 
-    Returns the archive path. The active file is the source of truth for
-    the runtime; the archive is purely for "load previous" UX.
+    Returns the archive path. The active file is the source of truth
+    for the runtime; the archive is purely for "load previous" UX.
     """
     hist_dir = _history_dir(active_path)
     hist_dir.mkdir(parents=True, exist_ok=True)
@@ -143,16 +185,16 @@ def _archive_calibration(active_path: Path, record: dict) -> Path:
     with open(archive_path, "w") as f:
         json.dump(record, f, indent=2)
 
-    # Snapshot the latest capture frame alongside the JSON. The capture
-    # worker writes /dev/shm/.../frame_back.jpg every ~1s, so this is
-    # at most 1s stale — close enough that the displayed click points
-    # still line up with the geometry at calibration time.
-    try:
-        frame_src = Path(CALIBRATION_FRAME_PATH)
-        if frame_src.exists():
-            shutil.copy2(frame_src, archive_path.with_suffix(".jpg"))
-    except OSError:
-        pass
+    jpg_target = archive_path.with_suffix(".jpg")
+    if frame_jpeg is not None:
+        _write_jpeg(jpg_target, frame_jpeg)
+    else:
+        try:
+            frame_src = Path(CALIBRATION_FRAME_PATH)
+            if frame_src.exists():
+                shutil.copy2(frame_src, jpg_target)
+        except OSError:
+            pass
     return archive_path
 
 
@@ -243,12 +285,20 @@ def create_calibration_router(
         }
         with open(cal_path, "w") as f:
             json.dump(record, f, indent=2)
+
+        # Decode and write the snapshot frame (sent by the UI). The
+        # active .jpg lives next to calibration_back.json so a hot-load
+        # via /history/load doesn't need to find a separate snapshot.
+        frame_jpeg = _decode_b64_jpeg(payload.frame_jpeg_b64)
+        if frame_jpeg is not None:
+            _write_jpeg(cal_path.with_suffix(".jpg"), frame_jpeg)
+
         # Archive a timestamped copy so the user can browse / restore
         # previous calibrations from the UI.
         archive_path: Optional[Path] = None
         try:
-            archive_path = _archive_calibration(cal_path, record)
-        except OSError as e:
+            archive_path = _archive_calibration(cal_path, record, frame_jpeg)
+        except OSError:
             # Archive failures are non-fatal — the active calibration is
             # already saved and reload-on-mtime will pick it up.
             archive_path = None
@@ -256,6 +306,7 @@ def create_calibration_router(
             "ok": True,
             "path": str(cal_path),
             "archive": str(archive_path) if archive_path else None,
+            "frame_saved": frame_jpeg is not None,
         }
 
     @router.delete("")
@@ -382,7 +433,69 @@ def create_calibration_router(
         tmp = cal_path.with_suffix(cal_path.suffix + ".tmp")
         shutil.copy2(src_resolved, tmp)
         tmp.replace(cal_path)
+        # Mirror the archive's snapshot (if any) onto the active .jpg so
+        # subsequent visits to the Calibration page see the right frame
+        # without having to remember which archive was loaded.
+        src_jpg = src_resolved.with_suffix(".jpg")
+        if src_jpg.exists():
+            tmp_jpg = cal_path.with_suffix(".jpg.tmp")
+            try:
+                shutil.copy2(src_jpg, tmp_jpg)
+                tmp_jpg.replace(cal_path.with_suffix(".jpg"))
+            except OSError:
+                pass
         return {"ok": True, "loaded": filename, "path": str(cal_path)}
+
+    @router.delete("/history")
+    async def delete_history(
+        filename: str, _t: str = Depends(check_session)
+    ):
+        """Remove an archived calibration (and its frame snapshot, if any).
+
+        Refuses if the archive is the currently-active one (mtime match)
+        to prevent accidental loss of the running configuration.
+        """
+        if not _HISTORY_NAME_RE.match(filename):
+            raise HTTPException(status_code=400, detail="Invalid filename")
+
+        raw = _load_yaml(get_config_path())
+        cal_path = Path(_calibration_path(raw))
+        hist_dir = _history_dir(cal_path)
+        json_path = hist_dir / filename
+        try:
+            json_resolved = json_path.resolve(strict=True)
+            hist_resolved = hist_dir.resolve(strict=True)
+        except (OSError, FileNotFoundError):
+            raise HTTPException(status_code=404, detail="Calibration not found")
+        if hist_resolved not in json_resolved.parents:
+            raise HTTPException(status_code=400, detail="Invalid path")
+
+        # Block deletion of the currently-active archive: same content
+        # remains in calibration_back.json, but losing the snapshot would
+        # leave the UI with no frame to show on the next visit.
+        try:
+            archive_mtime = json_resolved.stat().st_mtime
+            active_mtime = cal_path.stat().st_mtime if cal_path.exists() else None
+        except OSError:
+            archive_mtime = active_mtime = None
+        if (active_mtime is not None and archive_mtime is not None
+                and abs(active_mtime - archive_mtime) < 0.5):
+            raise HTTPException(
+                status_code=409,
+                detail="Cannot delete the currently active calibration",
+            )
+
+        try:
+            json_resolved.unlink()
+        except OSError as e:
+            raise HTTPException(status_code=500, detail=f"Delete failed: {e}")
+        jpg_path = json_resolved.with_suffix(".jpg")
+        if jpg_path.exists():
+            try:
+                jpg_path.unlink()
+            except OSError:
+                pass
+        return {"ok": True, "deleted": filename}
 
     def _toggle(target_mode: str) -> JSONResponse:
         now = time.time()

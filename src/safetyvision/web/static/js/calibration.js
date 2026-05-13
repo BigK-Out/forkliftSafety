@@ -18,12 +18,16 @@ const historyList = document.getElementById('historyList');
 
 const POINT_COLORS = ['#00c853', '#ffd600', '#448aff', '#ff1744'];
 const REDUCED_MOTION = window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+const POINT_RADIUS = 8;             // visual radius (canvas px)
+const POINT_HIT_RADIUS = 14;        // drag hit radius (canvas px)
 const state = {
   frameLoaded: false,
   frameImg: null,
   frameWidth: 640,
   frameHeight: 480,
   points: [], // [{px, py, xm, ym}]
+  dragIdx: -1,           // index of point currently being dragged, -1 = none
+  dragMoved: false,      // set true once a drag actually moves; suppresses click
 };
 // Map filename -> last-seen item from /api/calibration/history. Filled by
 // refreshHistory(); read by previewHistoryItem() and loadHistoryItem() so
@@ -56,13 +60,14 @@ function redraw(animIdx = -1, animScale = 1) {
   if (!state.frameImg) return;
   ctx.drawImage(state.frameImg, 0, 0, canvas.width, canvas.height);
   state.points.forEach((p, i) => {
-    const r = (i === animIdx) ? 8 * animScale : 8;
+    let r = (i === animIdx) ? POINT_RADIUS * animScale : POINT_RADIUS;
+    if (i === state.dragIdx) r = POINT_RADIUS + 2;
     if (r < 0.5) return;
     ctx.fillStyle = POINT_COLORS[i];
     ctx.beginPath();
     ctx.arc(p.px, p.py, r, 0, 2 * Math.PI);
     ctx.fill();
-    ctx.strokeStyle = '#000';
+    ctx.strokeStyle = (i === state.dragIdx) ? '#fff' : '#000';
     ctx.lineWidth = 2;
     ctx.stroke();
     if (r > 4) {
@@ -73,6 +78,41 @@ function redraw(animIdx = -1, animScale = 1) {
       ctx.fillText(String(i + 1), p.px, p.py);
     }
   });
+}
+
+// Map a pointer event to canvas-intrinsic coordinates, accounting for
+// the canvas being displayed at a different size than its bitmap.
+function pointerToCanvas(e) {
+  const rect = canvas.getBoundingClientRect();
+  return {
+    x: (e.clientX - rect.left) * (canvas.width / rect.width),
+    y: (e.clientY - rect.top) * (canvas.height / rect.height),
+  };
+}
+
+// Return the index of the topmost point under (x, y), or -1.
+function pointAt(x, y) {
+  // Iterate in reverse so a newer point on top of an older one wins.
+  for (let i = state.points.length - 1; i >= 0; i--) {
+    const p = state.points[i];
+    const dx = p.px - x;
+    const dy = p.py - y;
+    if (dx * dx + dy * dy <= POINT_HIT_RADIUS * POINT_HIT_RADIUS) return i;
+  }
+  return -1;
+}
+
+// Cheaply update just the pixel-readout for a single point row, without
+// rebuilding the whole Points panel (which would be ~60×/s during drag).
+function updatePixelReadout(idx) {
+  const rows = pointInputs.querySelectorAll('.point-row');
+  const row = rows[idx];
+  if (!row) return;
+  const span = row.querySelector('.px-text');
+  if (!span) return;
+  const p = state.points[idx];
+  span.textContent =
+    `px (${Math.round(p.px)}, ${Math.round(p.py)})`;
 }
 
 // Pop-in animation for the most recently placed marker. Ease-out-back
@@ -121,7 +161,7 @@ function rebuildPointInputs() {
       </div>
       <div class="point-pixel">
         <i data-lucide="crosshair" style="width:10px;height:10px;"></i>
-        px (${Math.round(p.px)}, ${Math.round(p.py)})
+        <span class="px-text">px (${Math.round(p.px)}, ${Math.round(p.py)})</span>
       </div>
     `;
     pointInputs.appendChild(row);
@@ -162,20 +202,71 @@ function canSave() {
   );
 }
 
-canvas.addEventListener('click', (e) => {
+// Pointer-event-driven placement + drag. Mousedown on an existing marker
+// begins a drag; mousedown on empty space + release without movement
+// places a new marker (up to 4). `dragMoved` distinguishes the two.
+canvas.addEventListener('pointerdown', (e) => {
   if (!state.frameLoaded) return;
-  if (state.points.length >= 4) {
-    showToast('4 points already placed. Reset to start over.', 'warn');
+  if (e.button !== undefined && e.button !== 0) return;
+  const { x, y } = pointerToCanvas(e);
+  const hitIdx = pointAt(x, y);
+  if (hitIdx >= 0) {
+    state.dragIdx = hitIdx;
+    state.dragMoved = false;
+    canvas.setPointerCapture(e.pointerId);
+    canvas.style.cursor = 'grabbing';
+    redraw(); // re-render with the dragged marker highlighted
+    e.preventDefault();
     return;
   }
-  const rect = canvas.getBoundingClientRect();
-  const sx = canvas.width / rect.width;
-  const sy = canvas.height / rect.height;
-  const px = (e.clientX - rect.left) * sx;
-  const py = (e.clientY - rect.top) * sy;
-  state.points.push({ px, py, xm: null, ym: null });
+  // Empty space — defer placement to pointerup so we don't place a point
+  // when the user starts a drag, decides against it, and releases.
+  state.dragIdx = -1;
+  state.dragMoved = false;
+});
+
+canvas.addEventListener('pointermove', (e) => {
+  if (!state.frameLoaded) return;
+  if (state.dragIdx < 0) {
+    // Hover feedback: grab cursor over a marker, crosshair elsewhere.
+    const { x, y } = pointerToCanvas(e);
+    canvas.style.cursor = pointAt(x, y) >= 0 ? 'grab' : 'crosshair';
+    return;
+  }
+  const { x, y } = pointerToCanvas(e);
+  const p = state.points[state.dragIdx];
+  p.px = Math.max(0, Math.min(canvas.width, x));
+  p.py = Math.max(0, Math.min(canvas.height, y));
+  state.dragMoved = true;
+  redraw();
+  updatePixelReadout(state.dragIdx);
+});
+
+canvas.addEventListener('pointerup', (e) => {
+  if (!state.frameLoaded) return;
+  if (state.dragIdx >= 0) {
+    // End of a drag — release capture and reset state.
+    try { canvas.releasePointerCapture(e.pointerId); } catch (_) {}
+    state.dragIdx = -1;
+    canvas.style.cursor = 'crosshair';
+    redraw();
+    return;
+  }
+  // No drag in progress — treat as a click on empty space (place point).
+  if (state.points.length >= 4) {
+    showToast('4 points already placed. Drag an existing point to adjust.', 'warn');
+    return;
+  }
+  const { x, y } = pointerToCanvas(e);
+  state.points.push({ px: x, py: y, xm: null, ym: null });
   animateMarkerIn(state.points.length - 1);
   rebuildPointInputs();
+});
+
+canvas.addEventListener('pointercancel', () => {
+  state.dragIdx = -1;
+  canvas.style.cursor = 'crosshair';
+  redraw();
 });
 
 captureBtn.addEventListener('click', async () => {
@@ -214,6 +305,20 @@ resetBtn.addEventListener('click', () => {
   rebuildPointInputs();
 });
 
+// Render state.frameImg to a fresh canvas (no dot overlays) and return
+// the raw base64 portion of a JPEG data URL. Returns null if no frame
+// is loaded so the backend can still archive a points-only entry.
+function frameJpegB64() {
+  if (!state.frameImg) return null;
+  const tmp = document.createElement('canvas');
+  tmp.width = state.frameWidth;
+  tmp.height = state.frameHeight;
+  tmp.getContext('2d').drawImage(state.frameImg, 0, 0);
+  const dataUrl = tmp.toDataURL('image/jpeg', 0.85);
+  const comma = dataUrl.indexOf(',');
+  return comma >= 0 ? dataUrl.slice(comma + 1) : null;
+}
+
 saveBtn.addEventListener('click', async () => {
   if (!canSave()) return;
   actionStatus.textContent = 'Saving...';
@@ -222,6 +327,7 @@ saveBtn.addEventListener('click', async () => {
     target_points: state.points.map(p => [p.xm, p.ym]),
     frame_width: state.frameWidth,
     frame_height: state.frameHeight,
+    frame_jpeg_b64: frameJpegB64(),
   };
   const r = await fetch('/api/calibration', {
     method: 'POST',
@@ -293,6 +399,10 @@ async function refreshHistory() {
             <i data-lucide="upload" style="width:12px;height:12px;"></i>
             Load
           </button>
+          <button class="btn-danger history-delete" data-filename="${item.filename}" title="Permanently remove this calibration from history" ${item.active ? 'disabled' : ''}>
+            <i data-lucide="trash-2" style="width:12px;height:12px;"></i>
+            Delete
+          </button>
         </div>
       `;
       historyList.appendChild(row);
@@ -302,6 +412,9 @@ async function refreshHistory() {
     });
     historyList.querySelectorAll('.history-preview').forEach(btn => {
       btn.addEventListener('click', () => previewHistoryItem(btn.dataset.filename));
+    });
+    historyList.querySelectorAll('.history-delete').forEach(btn => {
+      btn.addEventListener('click', () => deleteHistoryItem(btn.dataset.filename));
     });
     if (window.lucide && typeof window.lucide.createIcons === 'function') {
       window.lucide.createIcons();
@@ -380,6 +493,23 @@ async function showHistoryFrame(item) {
   redraw();
   rebuildPointInputs();
   return frameKind;
+}
+
+async function deleteHistoryItem(filename) {
+  if (!confirm(`Permanently delete "${filename}" from history?`)) return;
+  const url = '/api/calibration/history?filename='
+    + encodeURIComponent(filename);
+  const r = await fetch(url, { method: 'DELETE' });
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok || data.ok === false) {
+    actionStatus.textContent =
+      'Delete failed: ' + (data.detail || data.error || r.statusText);
+    showToast('Delete failed', 'error');
+    return;
+  }
+  actionStatus.textContent = 'Deleted ' + filename;
+  showToast('Calibration deleted', 'success');
+  refreshHistory();
 }
 
 async function previewHistoryItem(filename) {
