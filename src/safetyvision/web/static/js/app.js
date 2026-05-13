@@ -302,6 +302,51 @@
     } catch { toast('Connection error', 'error'); }
   });
 
+  // ── Mute toggle ─────────────────────────────────────────────
+  // AlertWorker runs in a separate process; mute state is shared via a flag
+  // file on disk (see safetyvision/runtime_state.py).
+  const muteBtn = document.getElementById('muteBtn');
+  const muteLabel = document.getElementById('muteLabel');
+
+  function applyMuteUI(muted) {
+    if (!muteBtn) return;
+    muteBtn.classList.toggle('muted', !!muted);
+    muteBtn.setAttribute('aria-pressed', muted ? 'true' : 'false');
+    muteBtn.title = muted ? 'Unmute alert audio' : 'Mute alert audio';
+    if (muteLabel) muteLabel.textContent = muted ? 'Muted' : 'Mute';
+  }
+
+  async function loadMuteState() {
+    try {
+      const res = await fetch('/api/mute');
+      if (!res.ok) return;
+      const data = await res.json();
+      applyMuteUI(!!data.muted);
+    } catch {}
+  }
+  loadMuteState();
+
+  if (muteBtn) {
+    muteBtn.addEventListener('click', async () => {
+      try {
+        const res = await fetch('/api/mute', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({}),  // empty body → server toggles
+        });
+        const data = await res.json();
+        if (!res.ok) {
+          toast(data.detail || 'Mute toggle failed', 'error');
+          return;
+        }
+        applyMuteUI(!!data.muted);
+        toast(data.muted ? 'Alerts muted' : 'Alerts unmuted');
+      } catch {
+        toast('Connection error', 'error');
+      }
+    });
+  }
+
   // ── Logout ──────────────────────────────────────────────────
   document.getElementById('logoutBtn').addEventListener('click', async () => {
     await fetch('/api/auth/logout', { method: 'POST' });

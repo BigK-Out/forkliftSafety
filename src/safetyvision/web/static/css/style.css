@@ -276,6 +276,22 @@ header {
   border-color: var(--border);
 }
 .btn-ghost.active { color: var(--primary); border-color: var(--border); background: rgba(230,237,243,0.04); }
+
+/* Mute toggle: swap icons via a parent `.muted` class so we don't have to
+   re-invoke lucide.createIcons() after every state change. */
+.mute-btn .icon-muted { display: none; }
+.mute-btn.muted .icon-unmuted { display: none; }
+.mute-btn.muted .icon-muted { display: inline-block; }
+.mute-btn.muted {
+  color: var(--red);
+  border-color: rgba(248,81,73,0.35);
+  background: rgba(248,81,73,0.08);
+}
+.mute-btn.muted:hover {
+  color: var(--red);
+  border-color: rgba(248,81,73,0.55);
+  background: rgba(248,81,73,0.14);
+}
 .btn-outline:hover {
   background: rgba(230,237,243,0.06);
   color: var(--text);

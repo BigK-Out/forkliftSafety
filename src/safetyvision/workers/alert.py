@@ -13,6 +13,7 @@ from typing import Optional
 import numpy as np
 from loguru import logger
 
+from safetyvision import runtime_state
 from safetyvision.config import SafetyVisionConfig
 from safetyvision.types import AlertEvent
 
@@ -178,6 +179,19 @@ class AlertWorker:
             )
 
             sound_key = alert.sound_key if alert.sound_key in self._clip_map else "danger"
+
+            # Respect runtime mute flag (toggled from the web UI). Detection
+            # and decision pipelines continue normally; only audio output is
+            # suppressed so the mute is reversible at any time without
+            # restarting the service.
+            if runtime_state.is_muted(self._cfg.logging.log_dir):
+                alert.audio_started_ms = 0.0
+                logger.info(
+                    "Alert audio muted: skipping playback (sound_key={})",
+                    sound_key,
+                )
+                continue
+
             clip = self._clip_map.get(sound_key)
             clip_path = self._clip_path_map.get(sound_key, self._cfg.alert.siren_wav)
             start_ms = self._play_clip(clip, clip_path)

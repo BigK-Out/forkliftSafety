@@ -27,6 +27,7 @@ from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel
 from starlette.middleware.cors import CORSMiddleware
 
+from safetyvision import runtime_state
 from safetyvision.config import SafetyVisionConfig, load_config, validate, ConfigError
 from safetyvision.web.calibration import create_calibration_router
 
@@ -113,6 +114,40 @@ async def auth_check(request: Request):
     token = request.cookies.get("sv_session")
     ok = token in SESSION_TOKENS and time.time() < SESSION_TOKENS.get(token, 0)
     return {"authenticated": ok}
+
+
+# ---------------------------------------------------------------------------
+# Mute toggle (cross-process; AlertWorker reads the same flag)
+# ---------------------------------------------------------------------------
+class MuteRequest(BaseModel):
+    # Optional: when omitted, POST /api/mute toggles the current state.
+    muted: Optional[bool] = None
+
+
+def _runtime_log_dir() -> str:
+    """Resolve ``logging.log_dir`` from the active config, with a sane default.
+
+    Matches the supervisor's resolution so the mute flag file path is the
+    same in both processes.
+    """
+    raw = _load_raw_config()
+    log_dir = raw.get("logging", {}).get("log_dir") or "./logs"
+    return str(log_dir)
+
+
+@app.get("/api/mute")
+async def get_mute(_token: str = Depends(_check_session)):
+    return {"muted": runtime_state.is_muted(_runtime_log_dir())}
+
+
+@app.post("/api/mute")
+async def set_mute(body: MuteRequest, _token: str = Depends(_check_session)):
+    log_dir = _runtime_log_dir()
+    if body.muted is None:
+        new_state = runtime_state.toggle_muted(log_dir)
+    else:
+        new_state = runtime_state.set_muted(log_dir, bool(body.muted))
+    return {"muted": new_state}
 
 
 # ---------------------------------------------------------------------------
